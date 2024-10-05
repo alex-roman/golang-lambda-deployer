@@ -8,8 +8,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -17,19 +19,20 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/lambda"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/spf13/cobra"
 )
 
 var env string
-var tail bool
 
 type DeployConfig struct {
-	Env          string `json:"env"`
-	AppName      string `json:"app_name"`
-	LambdaName   string // Combined AppName and Env
-	BuildsBucket string `json:"builds_bucket"`
-	LogGroupName string `json:"log_group_name"`
+	Env                string `json:"env"`
+	AppName            string `json:"app_name"`
+	LambdaName         string // Combined AppName and Env
+	SourceCodeFilename string // LambdaName + commit + '.zip'; it appends -dirty if there are uncommitted changes
+	BuildsBucket       string `json:"builds_bucket"`
+	LogGroupName       string `json:"log_group_name"`
 }
 
 type Deployer struct {
@@ -47,7 +50,7 @@ func main() {
 	}
 
 	rootCmd.Flags().StringVarP(&env, "env", "e", "", "Environment name postfix (prod-use1|stag)")
-	rootCmd.Flags().BoolVar(&tail, "tail", false, "Tail logs after deployment")
+	// rootCmd.Flags().BoolVar(&tail, "tail", false, "Tail logs after deployment")
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
@@ -62,7 +65,7 @@ func runDeploy(cmd *cobra.Command, args []string) {
 
 	availableFunctions := de.getAvailableFunctions()
 	if !contains(availableFunctions, de.Config.LambdaName) {
-		fmt.Printf("Lambda function %s does not exist\n", de.Config.LambdaName)
+		fmt.Printf("Lambda function '%s' does not exist\n", de.Config.LambdaName)
 		fmt.Printf("Available functions are: %s\n", strings.Join(availableFunctions, ", "))
 		os.Exit(1)
 	}
@@ -74,15 +77,9 @@ func runDeploy(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	goarch := de.determineFunctionArch()
-	fmt.Printf("Selected: GOARCH=%s\n", goarch)
-
 	// Build and deploy the function
-	de.buildAndDeploy(goarch)
-
-	if tail {
-		de.tailLogs(de.Config)
-	}
+	de.buildAndDeploy()
+	de.tailLogs()
 }
 
 func getAppName() string {
@@ -107,17 +104,29 @@ func (de *Deployer) initAWSClient() {
 }
 
 func (de *Deployer) getAvailableFunctions() []string {
-	input := &lambda.ListFunctionsInput{}
-	output, err := de.LambdaClient.ListFunctions(context.Background(), input)
-	if err != nil {
-		fmt.Println("Error listing Lambda functions:", err)
-		os.Exit(1)
+	var functionNames []string
+	var nextMarker *string
+
+	for {
+		input := &lambda.ListFunctionsInput{
+			Marker: nextMarker,
+		}
+		output, err := de.LambdaClient.ListFunctions(context.Background(), input)
+		if err != nil {
+			fmt.Println("Error listing Lambda functions:", err)
+			os.Exit(1)
+		}
+
+		for _, function := range output.Functions {
+			functionNames = append(functionNames, *function.FunctionName)
+		}
+
+		if output.NextMarker == nil {
+			break
+		}
+		nextMarker = output.NextMarker
 	}
 
-	var functionNames []string
-	for _, function := range output.Functions {
-		functionNames = append(functionNames, *function.FunctionName)
-	}
 	return functionNames
 }
 
@@ -147,29 +156,44 @@ func (de *Deployer) determineFunctionArch() string {
 		os.Exit(1)
 	}
 
-	return string(output.Architectures[0])
+	fmt.Println("Architecture: ", output.Architectures)
+	if output.Architectures[0] == "arm64" {
+		return "arm64"
+	}
+	return "amd64"
 }
 
-func (de *Deployer) buildAndDeploy(goarch string) {
+func (de *Deployer) buildAndDeploy() {
 	fmt.Println("Building and deploying...")
-	de.build(goarch)
+	de.build()
+	de.uploadToS3()
 	de.deploy()
+	de.tailLogs()
 }
 
-func (de *Deployer) build(goarch string) {
+func (de *Deployer) build() {
 	currentGitCommit := de.getCurrentGitCommit()
 	cmd := exec.Command("go", "build", "-ldflags", fmt.Sprintf("-s -w -X main.commit=%s", currentGitCommit), "-o", "bootstrap", ".")
-	cmd.Env = append(os.Environ(), fmt.Sprintf("GOARCH=%s", goarch))
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+	cmd.Env = append(os.Environ(), fmt.Sprintf("GOARCH=%s", de.determineFunctionArch()), "CGO_ENABLED=0", "GOOS=linux")
+	// cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
+	fmt.Printf("cmd.Env: %+v\n", cmd.Env)
 	if err := cmd.Run(); err != nil {
 		fmt.Println("Error building the project:", err)
 		os.Exit(1)
 	}
 
-	zipFile, err := os.Create("bootstrap.zip")
+	// Ensure the binary is executable
+	if err := os.Chmod("bootstrap", 0755); err != nil {
+		fmt.Println("Error setting executable permissions on binary:", err)
+		os.Exit(1)
+	}
+
+	// Create the ZIP file
+	de.Config.SourceCodeFilename = fmt.Sprintf("%s-%s.zip", de.Config.LambdaName, de.getCurrentGitCommit())
+	zipFile, err := os.Create(de.Config.SourceCodeFilename)
 	if err != nil {
 		fmt.Println("Error creating zip file:", err)
 		os.Exit(1)
@@ -177,8 +201,8 @@ func (de *Deployer) build(goarch string) {
 	defer zipFile.Close()
 
 	zipWriter := zip.NewWriter(zipFile)
-	defer zipWriter.Close()
 
+	// Add the binary to the ZIP file
 	binaryFile, err := os.Open("bootstrap")
 	if err != nil {
 		fmt.Println("Error opening binary file:", err)
@@ -197,18 +221,86 @@ func (de *Deployer) build(goarch string) {
 		os.Exit(1)
 	}
 
-	zipFile.Seek(0, 0)
+	// Ensure all data is written to the ZIP file
+	if err := zipWriter.Close(); err != nil {
+		fmt.Println("Error finalizing zip file:", err)
+		os.Exit(1)
+	}
+}
+
+func (de *Deployer) uploadToS3() {
+	zipFile, err := os.Open(de.Config.SourceCodeFilename)
+	if err != nil {
+		fmt.Println("Error opening zip file:", err)
+		os.Exit(1)
+	}
+	defer zipFile.Close()
 
 	uploader := manager.NewUploader(de.S3Client)
 	_, err = uploader.Upload(context.TODO(), &s3.PutObjectInput{
-		Bucket: aws.String(de.Config.BuildsBucket),
-		Key:    aws.String("bootstrap.zip"),
-		Body:   zipFile,
+		Bucket:               aws.String(de.Config.BuildsBucket),
+		Key:                  aws.String(de.Config.SourceCodeFilename),
+		Body:                 zipFile,
+		ServerSideEncryption: types.ServerSideEncryptionAes256,
 	})
 	if err != nil {
 		fmt.Println("Error uploading zip to S3:", err)
 		os.Exit(1)
 	}
+	// if err := os.Remove(de.Config.SourceCodeFilename); err != nil {
+	// 	fmt.Println("Error deleting zip file:", err)
+	// }
+
+	fmt.Printf("Released %s to %s\n", de.Config.SourceCodeFilename, de.Config.BuildsBucket)
+}
+
+func (de *Deployer) deploy() {
+	input := &lambda.UpdateFunctionCodeInput{
+		FunctionName: aws.String(de.Config.LambdaName),
+		S3Bucket:     aws.String(de.Config.BuildsBucket),
+		S3Key:        aws.String(de.Config.SourceCodeFilename),
+	}
+
+	_, err := de.LambdaClient.UpdateFunctionCode(context.Background(), input)
+	if err != nil {
+		fmt.Println("Error updating Lambda function code:", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("Waiting for the function to be updated...")
+
+	waiter := lambda.NewFunctionUpdatedV2Waiter(de.LambdaClient)
+	err = waiter.Wait(context.Background(), &lambda.GetFunctionInput{
+		FunctionName: aws.String(de.Config.LambdaName),
+	}, 5*time.Minute)
+	if err != nil {
+		fmt.Println("Error waiting for function update:", err)
+		os.Exit(1)
+	}
+
+	publishInput := &lambda.PublishVersionInput{
+		FunctionName: aws.String(de.Config.LambdaName),
+	}
+
+	publishOutput, err := de.LambdaClient.PublishVersion(context.Background(), publishInput)
+	if err != nil {
+		fmt.Println("Error publishing new Lambda version:", err)
+		os.Exit(1)
+	}
+
+	updateAliasInput := &lambda.UpdateAliasInput{
+		FunctionName:    aws.String(de.Config.LambdaName),
+		Name:            aws.String("canary"),
+		FunctionVersion: publishOutput.Version,
+	}
+
+	_, err = de.LambdaClient.UpdateAlias(context.Background(), updateAliasInput)
+	if err != nil {
+		fmt.Println("Error updating Lambda alias 'canary':", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Published new version %s and updated alias 'canary' to point to it\n", *publishOutput.Version)
 }
 
 func (de *Deployer) getCurrentGitCommit() string {
@@ -217,44 +309,90 @@ func (de *Deployer) getCurrentGitCommit() string {
 		fmt.Println("Error getting current Git commit:", err)
 		os.Exit(1)
 	}
-	return strings.TrimSpace(string(commit))
+
+	// Check for uncommitted changes
+	status, err := exec.Command("git", "status", "--porcelain").Output()
+	if err != nil {
+		fmt.Println("Error checking git status:", err)
+		os.Exit(1)
+	}
+
+	commitStr := strings.TrimSpace(string(commit))[0:7]
+	if len(status) > 0 {
+		commitStr += "-dirty"
+	}
+
+	return commitStr
 }
 
-func (de *Deployer) tailLogs(deployConfig DeployConfig) {
+func (de *Deployer) tailLogs() {
 	availableLogGroups := de.getAvailableLogGroups()
-	if !contains(availableLogGroups, deployConfig.LogGroupName) {
-		fmt.Printf("Log group %s does not exist\n", deployConfig.LogGroupName)
+	if !contains(availableLogGroups, de.Config.LogGroupName) {
+		fmt.Printf("Log group %s does not exist\n", de.Config.LogGroupName)
 		fmt.Printf("Available log groups are: %s\n", strings.Join(availableLogGroups, ", "))
 		os.Exit(1)
 	}
 
 	input := &cloudwatchlogs.FilterLogEventsInput{
-		LogGroupName: aws.String(deployConfig.LogGroupName),
+		LogGroupName:  aws.String(de.Config.LogGroupName),
+		FilterPattern: aws.String(`-"START RequestId" -"REPORT RequestId" -"END RequestId" -"INIT_START Runtime" -"EXTENSION"`),
 	}
 
-	stream, err := de.CloudwatchClient.FilterLogEvents(context.Background(), input)
-	if err != nil {
-		fmt.Println("Error filtering log events:", err)
-		os.Exit(1)
-	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	for _, event := range stream.Events {
-		fmt.Printf("[%s] %s\n", *event.Timestamp, *event.Message)
+	go func() {
+		c := make(chan os.Signal, 1)
+		signal.Notify(c, os.Interrupt)
+		<-c
+		cancel()
+	}()
+
+	for {
+		stream, err := de.CloudwatchClient.FilterLogEvents(ctx, input)
+		if err != nil {
+			fmt.Println("Error filtering log events:", err)
+			os.Exit(1)
+		}
+
+		for _, event := range stream.Events {
+			fmt.Printf("[%s] %s\n", *event.Timestamp, *event.Message)
+		}
+
+		select {
+		case <-ctx.Done():
+			fmt.Println("Stopping log tailing...")
+			return
+		case <-time.After(5 * time.Second):
+			// Continue to fetch new logs after a delay
+		}
 	}
 }
 
 func (de *Deployer) getAvailableLogGroups() []string {
-	input := &cloudwatchlogs.DescribeLogGroupsInput{}
-	output, err := de.CloudwatchClient.DescribeLogGroups(context.Background(), input)
-	if err != nil {
-		fmt.Println("Error describing log groups:", err)
-		os.Exit(1)
+	var logGroupNames []string
+	var nextToken *string
+
+	for {
+		input := &cloudwatchlogs.DescribeLogGroupsInput{
+			NextToken: nextToken,
+		}
+		output, err := de.CloudwatchClient.DescribeLogGroups(context.Background(), input)
+		if err != nil {
+			fmt.Println("Error describing log groups:", err)
+			os.Exit(1)
+		}
+
+		for _, logGroup := range output.LogGroups {
+			logGroupNames = append(logGroupNames, *logGroup.LogGroupName)
+		}
+
+		if output.NextToken == nil {
+			break
+		}
+		nextToken = output.NextToken
 	}
 
-	var logGroupNames []string
-	for _, logGroup := range output.LogGroups {
-		logGroupNames = append(logGroupNames, *logGroup.LogGroupName)
-	}
 	return logGroupNames
 }
 
@@ -298,6 +436,7 @@ func loadConfigOrDefaults() DeployConfig {
 	if config.BuildsBucket == "" {
 		config.BuildsBucket = "e4f-builds"
 	}
+	config.LambdaName = fmt.Sprintf("%s-%s", config.AppName, config.Env)
 	if config.LogGroupName == "" {
 		config.LogGroupName = fmt.Sprintf("/aws/lambda/%s-%s", config.AppName, config.Env)
 	}
