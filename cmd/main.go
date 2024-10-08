@@ -6,9 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"strings"
 	"time"
@@ -17,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
+	cwtypes "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
 	"github.com/aws/aws-sdk-go-v2/service/lambda"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -175,11 +176,9 @@ func (de *Deployer) build() {
 	currentGitCommit := de.getCurrentGitCommit()
 	cmd := exec.Command("go", "build", "-ldflags", fmt.Sprintf("-s -w -X main.commit=%s", currentGitCommit), "-o", "bootstrap", ".")
 	cmd.Env = append(os.Environ(), fmt.Sprintf("GOARCH=%s", de.determineFunctionArch()), "CGO_ENABLED=0", "GOOS=linux")
-	// cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	fmt.Printf("cmd.Env: %+v\n", cmd.Env)
 	if err := cmd.Run(); err != nil {
 		fmt.Println("Error building the project:", err)
 		os.Exit(1)
@@ -333,40 +332,23 @@ func (de *Deployer) tailLogs() {
 		os.Exit(1)
 	}
 
-	input := &cloudwatchlogs.FilterLogEventsInput{
-		LogGroupName:  aws.String(de.Config.LogGroupName),
-		FilterPattern: aws.String(`-"START RequestId" -"REPORT RequestId" -"END RequestId" -"INIT_START Runtime" -"EXTENSION"`),
+	request := &cloudwatchlogs.StartLiveTailInput{
+		LogGroupIdentifiers:   []string{de.getARNofLogGroup()},
+		LogEventFilterPattern: aws.String(`-"START RequestId" -"REPORT RequestId" -"END RequestId" -"INIT_START Runtime" -"EXTENSION"`),
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go func() {
-		c := make(chan os.Signal, 1)
-		signal.Notify(c, os.Interrupt)
-		<-c
-		cancel()
-	}()
-
-	for {
-		stream, err := de.CloudwatchClient.FilterLogEvents(ctx, input)
-		if err != nil {
-			fmt.Println("Error filtering log events:", err)
-			os.Exit(1)
-		}
-
-		for _, event := range stream.Events {
-			fmt.Printf("[%s] %s\n", *event.Timestamp, *event.Message)
-		}
-
-		select {
-		case <-ctx.Done():
-			fmt.Println("Stopping log tailing...")
-			return
-		case <-time.After(5 * time.Second):
-			// Continue to fetch new logs after a delay
-		}
+	response, err := de.CloudwatchClient.StartLiveTail(context.Background(), request)
+	if err != nil {
+		log.Fatalf("Failed to start streaming: %v", err)
 	}
+
+	stream := response.GetStream()
+	go handleEventStreamAsync(stream)
+
+	// Close the stream (which ends the session) after a timeout
+	time.Sleep(300 * time.Second)
+	stream.Close()
+	log.Println("Event stream closed")
 }
 
 func (de *Deployer) getAvailableLogGroups() []string {
@@ -441,4 +423,49 @@ func loadConfigOrDefaults() DeployConfig {
 		config.LogGroupName = fmt.Sprintf("/aws/lambda/%s-%s", config.AppName, config.Env)
 	}
 	return config
+}
+
+func (de *Deployer) getARNofLogGroup() string {
+	input := &cloudwatchlogs.DescribeLogGroupsInput{
+		LogGroupNamePrefix: aws.String(de.Config.LogGroupName),
+	}
+
+	output, err := de.CloudwatchClient.DescribeLogGroups(context.Background(), input)
+	if err != nil {
+		fmt.Println("Error describing log groups:", err)
+		os.Exit(1)
+	}
+
+	if len(output.LogGroups) == 0 {
+		fmt.Printf("No log groups found for the given prefix %s\n", de.Config.LogGroupName)
+		os.Exit(1)
+	}
+
+	arn := strings.TrimSuffix(*output.LogGroups[0].Arn, ":*")
+	return arn
+}
+
+func handleEventStreamAsync(stream *cloudwatchlogs.StartLiveTailEventStream) {
+	eventsChan := stream.Events()
+	for {
+		event := <-eventsChan
+		switch e := event.(type) {
+		case *cwtypes.StartLiveTailResponseStreamMemberSessionStart:
+			log.Println("Received SessionStart event")
+		case *cwtypes.StartLiveTailResponseStreamMemberSessionUpdate:
+			for _, logEvent := range e.Value.SessionResults {
+				log.Println(*logEvent.Message)
+			}
+		default:
+			// Handle on-stream exceptions
+			if err := stream.Err(); err != nil {
+				log.Fatalf("Error occured during streaming: %v", err)
+			} else if event == nil {
+				log.Println("Stream is Closed")
+				return
+			} else {
+				log.Fatalf("Unknown event type: %T", e)
+			}
+		}
+	}
 }
