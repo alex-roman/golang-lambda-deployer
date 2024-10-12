@@ -54,12 +54,11 @@ jobs:
         with:
           go-version-file: 'go.mod'
 
-      - name: Install GoReleaser
-        run: |
-          curl -sL https://git.io/goreleaser | bash
-
       - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+            distribution: goreleaser
+            version: '~> v2'
+            args: release --clean
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: goreleaser release --rm-dist
-
+            GITHUB_TOKEN: ${{ secrets.PAT }}
