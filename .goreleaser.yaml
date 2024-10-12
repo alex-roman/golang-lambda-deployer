@@ -1,8 +1,14 @@
-project_name: golang-lambda-deployer 
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
 
 builds:
   - id: golang-lambda-deployer
     main: ./cmd/main.go
+    env:
+      - CGO_ENABLED=0
     goos:
       - linux
       - windows
