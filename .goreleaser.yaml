@@ -6,7 +6,7 @@ before:
 
 builds:
   - id: golang-lambda-deployer
-    main: ./cmd/main.go
+    main: ./deployer/main.go
     env:
       - CGO_ENABLED=0
     goos:
