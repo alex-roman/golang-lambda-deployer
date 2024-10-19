@@ -11,6 +11,7 @@ import (
 )
 
 var env string
+var tail bool
 
 func main() {
 	var rootCmd = &cobra.Command{
@@ -20,7 +21,7 @@ func main() {
 	}
 
 	rootCmd.Flags().StringVarP(&env, "env", "e", "", "Environment name postfix (prod-use1|stag)")
-	// rootCmd.Flags().BoolVar(&tail, "tail", false, "Tail logs after deployment")
+	rootCmd.Flags().BoolVar(&tail, "tail", false, "Tail logs after deployment")
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
@@ -50,7 +51,10 @@ func runDeploy(cmd *cobra.Command, args []string) {
 	// Build and deploy the function
 	de.Build()
 	de.Deploy()
-	de.TailLogs()
+
+	if tail {
+		de.TailLogs()
+	}
 }
 
 func contains(slice []string, item string) bool {
