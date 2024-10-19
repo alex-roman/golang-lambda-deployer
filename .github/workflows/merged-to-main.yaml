@@ -39,6 +39,7 @@ jobs:
           TAG=$(date +%Y%m%d%H%M)
           git tag $TAG
           git push origin $TAG
+          echo "GORELEASER_CURRENT_TAG=$TAG" >> $GITHUB_ENV
 
   release:
     needs: tag
