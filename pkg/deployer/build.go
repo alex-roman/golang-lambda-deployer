@@ -15,7 +15,7 @@ import (
 
 func (de *Deployer) Build() {
 	currentGitCommit := getCurrentGitCommit()
-	cmd := exec.Command("go", "build", "-ldflags", fmt.Sprintf("-s -w -X main.commit=%s", currentGitCommit), "-o", "bootstrap", ".")
+	cmd := exec.Command("go", "build", "-ldflags", fmt.Sprintf("-s -w -X main.Commit=%s -X microservice.CommitHash=%s", currentGitCommit, currentGitCommit), "-o", "bootstrap", ".")
 	cmd.Env = append(os.Environ(), fmt.Sprintf("GOARCH=%s", de.determineFunctionArch()), "CGO_ENABLED=0", "GOOS=linux")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
